@@ -1,0 +1,793 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Dec 28 13:10:09 2019
+
+@author: huiji
+"""
+
+from __future__ import absolute_import, division
+import time
+import os
+import numpy as np
+import sys
+
+import re
+from xlwt import*
+import math
+from math import *
+import xlrd
+import gdal
+import datetime
+import pandas as pd
+import numbers
+from collections import defaultdict
+import matplotlib.pyplot as plt
+from scipy.spatial.distance import euclidean
+from collections import  Counter
+import scipy.signal
+from pylab import *
+
+start = time.clock()
+
+############################################################################################################
+def read_tif_info(inpath):
+
+    ds=gdal.Open(inpath)
+    row=ds.RasterXSize
+    col=ds.RasterYSize
+#    band=ds.RasterCount
+#    print 'row,col',row,col
+    
+    proj=ds.GetProjection()
+#    pcs = osr.SpatialReference()
+#    pcs.ImportFromWkt(proj)
+#    gcs = pcs.CloneGeogCS()
+    extend = ds.GetGeoTransform()
+#    shape = (row,col)
+    
+    data = np.zeros((col,row))
+    dt=ds.GetRasterBand(1)
+    data[:,:]=dt.ReadAsArray()
+#    for i in range(band):
+#        dt=ds.GetRasterBand(1+i)
+##         data[:,:,i]=dt.ReadAsArray(0,0,col_half,row_half)
+#        data[:,:,i]=dt.ReadAsArray()
+#         print data[10000:10002,10280,i]
+#    print 'data',data[:,:,0]
+    x_range = range(0, row)
+    y_range = range(0, col)
+    x, y = np.meshgrid(x_range, y_range)
+    lon = extend[0] + x * extend[1] + y * extend[2]
+    lat = extend[3] + x * extend[4] + y * extend[5]
+    print('lat,lon',np.mean(lat),np.mean(lon))
+    return data,proj,extend,row,col,lat
+
+############################################################################################################
+def write_raster(outpathfile,array,geoTransform,proj):
+    cols=array.shape[1]
+    rows=array.shape[0]
+    driver=gdal.GetDriverByName('Gtiff')
+    outRaster=driver.Create(outpathfile,cols,rows,1,gdal.GDT_Float32)
+    outRaster.SetGeoTransform(geoTransform)
+    outband=outRaster.GetRasterBand(1)
+    outband.WriteArray(array)
+    outRaster.SetProjection(proj)
+
+############################################################################################################ 
+def findIndex(arr_data,thrd,iff):
+### arr_data 为数字，iff=0，代表小于；iff=1，代表大于
+    ii=0
+    index_arr = []
+    for arr_one in arr_data:
+        # print('arr_one',arr_one)
+        if iff==1:
+            if arr_one > thrd:
+                index_arr.append(ii)
+        elif iff==0:
+            if arr_one < thrd:
+                index_arr.append(ii)
+        
+        ii = ii + 1        
+    
+    return index_arr
+
+
+
+############################################################################################################ 
+def findMaxInterval(dmean,dmean_thrd):
+    diff_arr = (np.diff(np.array(dmean))).tolist()                             ##后前元素相减
+    dindex_back = findIndex(dmean,dmean_thrd,0)                                ## 从dmean找出小于dmean_thrd的下标
+    ddif_thrd = 2*100
+    while ddif_thrd >= 1*100:
+        dindex_diff = findIndex(diff_arr,ddif_thrd,1)                          ## 从diff_arr找出大于ddif_thrd的下标
+        dindex = list(set(dindex_back).intersection(set(dindex_diff)))
+        dn = len(dindex)
+    
+        if dn>4:
+            break
+        else:
+            ddif_thrd = ddif_thrd - 0.1*100
+            
+    return dindex
+        
+        
+############################################################################################################ 
+def estimate_continuousIndex(ddifs,transplate_postIndex,dindexM,syn):  
+    ddif_dindex = np.diff(np.array(dindexM))
+    if ~np.all(ddif_dindex==1):                     ##判断下标是否是连续的
+        
+        syn=0
+        return transplate_postIndex,syn
+    
+    ###如果下标是连续的，则检查下面的条件
+    if ddifs[dindexM[0]]<1 and ddifs[dindexM[1]]>ddifs[dindexM[0]]:
+        transplate_postIndex = dindexM[1]
+    else:
+        transplate_postIndex = dindexM[0]
+        
+    syn = 1
+    
+    return transplate_postIndex,syn           
+
+############################################################################################################ 
+
+def Transplate_condition(dmean,ddifs,transplate_postIndex,syn,dmean_len,lat0):
+    grow_period = 9
+    
+    if dmean_len < (transplate_postIndex+grow_period):
+#        print('dmean_len < (transplate_postIndex+grow_period)')
+        syn = 0
+        transplate_postIndex = 0
+        return transplate_postIndex,syn
+    
+    backs_TranspGrow = dmean[transplate_postIndex:transplate_postIndex+grow_period+1]
+    backs_max = max(backs_TranspGrow)
+    dmean_TranspGrowMax_index = dmean.index(backs_max)
+    
+########第一个条件
+    backs_afterTransp = dmean[transplate_postIndex+1:dmean_TranspGrowMax_index+1]
+    if np.all(np.array(backs_afterTransp) < -2150) or np.all(np.array(backs_afterTransp) > -1300):
+#        print('not [-21.5,-13] \n')
+        transplate_postIndex = 0
+        syn = 0
+    
+        return transplate_postIndex,syn
+    
+########第二个条件
+    ddifs_TranspPost = ddifs[transplate_postIndex:dmean_TranspGrowMax_index]
+### fprintf('ddifs_TranspPost = %2.2f \n',ddifs_TranspPost);
+    ddifs_TranspPost_array = np.array(ddifs_TranspPost)
+    ddifs_TranspPost_less  = ddifs_TranspPost_array[ddifs_TranspPost_array<0]
+### fprintf('ddifs_TranspPost_less = %2.2f \n',ddifs_TranspPost_less);
+    if ~np.all(ddifs_TranspPost_less > -200):                             
+#        print('diffs are not all more than -2  \n')
+        transplate_postIndex = 0
+        syn = 0
+
+        return transplate_postIndex,syn
+
+########第四个条件
+   
+    lenle = len(ddifs_TranspPost_less);               ### lenle为ddifs_TranspPost小于0的个数
+
+
+    if lenle > 5:                            ###曲线中 多余3个是呈下降趋势，则transplant为0  
+#        print('numbers of declining are more than 4 \n');
+        transplate_postIndex = 0
+
+        syn = 0
+        return transplate_postIndex,syn
+  
+    Dmm = backs_max-dmean[transplate_postIndex];
+    Dmm_index = dmean_TranspGrowMax_index - transplate_postIndex;      #####从post_tranplate开始，到收割结束，生长的时间不得低于5*12=60天
+###fprintf('backs_max = %d',backs_max);
+###fprintf('\n');
+####fprintf('dmean(transplate_postIndex) = %d',dmean(transplate_postIndex));
+####fprintf('\n');
+########第四个条件
+    if Dmm<4:
+#        print('different value beween max and min is less than 4 \n');
+        transplate_postIndex = 0
+        syn = 0
+        return transplate_postIndex,syn
+    
+    if Dmm_index <= 5: 
+#        print('different days beween max and min is less than 5 \n');
+        transplate_postIndex = 0
+        syn = 0
+        return transplate_postIndex,syn
+#####第五个条件 不能出现连续[-1,0,-1,0,-1,0-1]的趋势
+       
+    # if np.mean(lat0) > 32:
+    #     # print('lat<32')
+    #     if dmean[transplate_postIndex+11]<-20 or ddifs[transplate_postIndex+10]<-3:
+    #         # print('wheat')
+    #         transplate_postIndex = 0
+    #         syn = 0
+    #         return transplate_postIndex,syn
+        
+                
+    syn=1
+    return transplate_postIndex,syn
+
+############################################################################################################ 
+def riceCondition(dmean,ddifs,dindex,earlyestdate_index,latestdate_index,lat0):
+    
+    transplate_postIndex=0
+    dmean_len = len(dmean)
+    dn = len(dindex)
+    if dn == 0:
+#        print('dindex is none')
+        return 0
+    
+    sddif_thrd = 100
+    syn = 0
+    dindex_index = -1
+    # print('dindex',dindex)
+    for dd_index in dindex:
+        # print('dd_index',dd_index)
+        dindex_index = dindex_index + 1
+        #
+        if dd_index < earlyestdate_index or dd_index > latestdate_index:
+#            print('earlyestdate or dd_index > latestdate')
+            continue
+        
+        if syn == 1:
+            break
+        #
+        if dn > 1 and (dindex_index+3)<=dn:
+            
+            transplate_postIndex,syn = estimate_continuousIndex(ddifs,transplate_postIndex,dindex[dindex_index:dindex_index+3],syn)
+            
+            if syn == 1:
+                transplate_postIndex,syn=Transplate_condition(dmean,ddifs,transplate_postIndex,syn,dmean_len,lat0)
+                if transplate_postIndex > 0:
+                    
+                    return transplate_postIndex    ###满足条件，返回，否则继续执行下面的代码
+        #
+        if ddifs[dindex[dindex_index]+1] >sddif_thrd:
+            transplate_postIndex = dindex[dindex_index]
+            syn = 1
+        else:
+#            print('ddifs[dindex[dindex_index]+1] >sddif_thrd')
+            syn = 0
+            transplate_postIndex = 0
+            continue
+        
+        if transplate_postIndex > 0 :
+            # print('transplate_postIndex',transplate_postIndex)
+            transplate_postIndex,syn=Transplate_condition(dmean,ddifs,transplate_postIndex,syn,dmean_len,lat0)
+            if transplate_postIndex ==0:
+                syn = 0
+                transplate_postIndex = 0
+                continue
+                    
+        
+    # print('end transplate_postIndex', transplate_postIndex)
+    return transplate_postIndex         
+############################################################################################################
+def dateConvertTodays(dd):
+    dd = datetime.datetime.strptime(dd,"%Y%m%d")
+    days=dd.timetuple().tm_yday
+    return days            
+############################################################################################################ 
+def plotpeak(maxtab,t,series,fig):
+    ax = fig.add_subplot(1,2,1)
+    
+    a=zeros(len(t)) #
+    a[:]=count_thrd #
+    scatter(array(maxtab)[:,0], array(maxtab)[:,1], color='red',label = 'Local maximum')
+        
+    xlim([t[0],t[-1]])
+    ylim([0,1.1])
+        
+    title('Peak Detector')
+    grid(True)
+    plot(t,a,color='green',linestyle='--',dashes=(5,3))
+    plot(t,-a,color='green',linestyle='--',dashes=(5,3),label = 'Threshed of local maximum')
+
+    
+    plot(t,series/(max(series)-min(series)),'k',label = 'Count of pixels')
+    
+    # plt.annotate(sx,xy=(t[-5],1.0),fontsize=18)
+    
+    plt.ylabel('Normalized counts',fontsize=13)  
+    
+    plt.yticks(fontsize=11)
+            
+    plt.xlabel('DOY',fontsize=13)
+    plt.xticks(fontsize=13)    
+        
+    legend(loc='center', bbox_to_anchor=(1.75,0.6),fontsize=14,labelspacing= 1.5)
+############################################################################################################  
+def findThredforClass(result_raster):
+    num_binss=50
+    result_raster_oneArray = result_raster.reshape(-1,1)
+    result_raster_oneArray = result_raster_oneArray[result_raster_oneArray>0]
+    
+    ssv_max = max(result_raster_oneArray)
+    ssv_min = min(result_raster_oneArray)
+    interval_ssv = (ssv_max-ssv_min)/num_binss
+    class_value = [ssv_min + interval_ssv * i for i in range(1,num_binss+1)]
+    result_raster_pd = pd.DataFrame(result_raster_oneArray)    ###将矩阵转化为paradas的格式
+    rr = result_raster_pd[0].value_counts(bins=int(num_binss),sort=False)
+    maxtab,mintab = peakdet(class_value,rr.values,0)
+    
+    
+#    maxtab,mintab = peakdet(class_value,rr.values,0.01)
+    return maxtab,mintab,result_raster_oneArray,array(rr),array(class_value)
+############################################################################################################ 
+def plotthred(x_manual,y_manual,data_rs,num_bins,fig):
+  
+    ssv_thred = x_manual[y_manual == max(y_manual)]
+    ax = fig.add_subplot(1,2,2)
+    maxtabs,mintabs,ssv_oneArray,ssv_sort_count,ssv_sort_value = findThredforClass(data_rs)
+    n, bins, patches = ax.hist(ssv_oneArray, num_bins,normed=1,facecolor='blue', alpha=0.5,label = 'Histogram of ssv')
+    mintabs_len = len(mintabs) 
+        
+    ssv_count_precent = cumsum(n*(bins[1]-bins[0]))
+    ssv_thred90 = np.where(ssv_count_precent>=0.9)[0][0]
+      
+        
+    if mintabs_len==0:
+            
+        print('mintabs_len==0')
+        SSVminvalue,ssvmin_countss = findThred_diff(n,bins,maxtabs,ssv_thred90)
+        print('SSVminvalue',SSVminvalue)
+        if SSVminvalue==0:
+            mintabs = 0
+            
+        else:
+            mintabs = SSVminvalue
+##############
+    ssv_thred_fit = 0    
+    for i in range(mintabs_len):
+#            min_tabx = mintabs[i]
+#            ssv_thred_fit = min_tabx[0]          
+#            break
+        if mintabs[i][0] >=0.09:
+                
+            ssv_thred_fit = mintabs[i]
+            break
+        else:
+            continue
+    ssv_thred_fit=ssv_thred_fit[0]
+    if ssv_thred_fit==0:
+        print('ssv_thred_fit==0')
+        SSVminvalue,ssvmin_countss = findThred_diff(n,bins,maxtabs,ssv_thred90)
+        print('SSVminvalue',SSVminvalue)
+        if SSVminvalue==0:
+            ssv_thred_fit =0
+        else:
+            ssv_thred_fit = SSVminvalue
+                         
+####################################################################################################################################################################            
+           
+    plt.yticks(fontsize=11)
+
+    plt.ylabel('Probability',fontsize=13)  
+
+    plt.xlabel('ssv',fontsize=13)
+    plt.xticks(fontsize=11) 
+    
+
+       
+    ax2 = ax.twinx()
+#
+#             
+#    plt.set_ylims=[(0,1)]
+    
+    plt.annotate('threshold: '+str(round(ssv_thred_fit,2)),xy=(0.9,0.6),fontsize=12)
+
+    plt.yticks(fontsize=11)
+    plt.xlabel('ssv',fontsize=13) 
+    plt.xticks(fontsize=11)
+
+    b = arange(0,1.1,0.1)
+    a=np.zeros(len(b))
+    a[:] = ssv_thred
+    
+    ax2.plot(a,b,color='red',linestyle='--',dashes=(5,3),label = 'Threshed of ssv \n estimated by people')
+      
+        
+    b = arange(0,1.0,0.1)
+    a=np.zeros(len(b))
+    a[:] = ssv_thred_fit
+
+    ax2.plot(a,b,color='lime',linestyle='--',dashes=(5,3),label = 'Threshed of ssv by \n self-adapting method')
+
+
+    fig.legend(loc='center', bbox_to_anchor=(0.8,0.5),fontsize=8,labelspacing= 1.5,frameon = False,numpoints = 1)
+############################################################################################################ 
+def findMaxCountRice(post_transplate_Data,earlyestDate0,latestDate0,count_thrd,fig):
+    riceType =[0,0] 
+    date_index = arange(earlyestDate0+12,latestDate0+14,12)           ##假设识别的post_transplate日期在[earlyestDate,latestDate]区间
+    date_index_counts = [sum(post_transplate_Data==i) for i in date_index] 
+    print('date_index',date_index)
+    print('date_index_counts',date_index_counts)
+#####寻找date_index_counts的极大值即峰值
+    maxtab,mintab = peakdet(date_index,date_index_counts,count_thrd)   
+    print('maxtab',maxtab)
+    post_transolates= array(maxtab)[:,0]
+    print('post_transolates',post_transolates)
+    riceType = len(post_transolates)
+    if riceType > 3:        
+        maxtab_countSort = sorted(enumerate(array(maxtab)[:,1]), key=lambda x:x[1],reverse=True)
+        post_transolates = array(maxtab_countSort)[0:3,0]       ###获取前三个最多值
+        
+    # plotpeak(maxtab,date_index,date_index_counts,fig)    
+    
+    return post_transolates
+    
+        
+############################################################################################################                 
+def peakdet(x,v,thresh):
+
+   
+    maxtab = []
+    mintab = []
+
+    v = asarray(v)
+    v=v/(max(v)-min(v))
+    print('v',v)
+    mn, mx = v[0], v[0]
+    mnpos, mxpos = NaN, NaN
+    
+    mx = v[0]
+    mxpos = NaN
+    
+    lookformax = True
+
+    for i in arange(len(v)):
+#        print('x[i]',x[i])
+        this = v[i]
+        if abs(this)>=0:
+#            print('abs(this)',abs(this))
+            if this > mx:
+                mx = this
+                mxpos = x[i]
+            if this < mn:
+                mn = this
+                mnpos = x[i]
+            if lookformax:
+                if (this < mx):
+                    if (mx>abs(thresh)) and not isnan(mxpos):
+                        maxtab.append((mxpos, mx))
+                    mn = this
+                    mnpos = x[i]
+                    lookformax = False
+            else:
+                if (this > mn):
+                    if (mn<-abs(thresh)) and not isnan(mnpos):
+                        mintab.append((mnpos, mn))
+                    mx = this
+                    mxpos = x[i]
+                    lookformax = True
+                    
+    return array(maxtab),array(mintab)
+
+############################################################################################################     
+def ssvAlgor(t,p,ts_len,ed_max,ed_min):
+    ed_orig_square = t[:,:,0]*0
+   
+    for i in range(ts_len):
+        ed_orig_square = ed_orig_square + (t[:,:,i]-p[:,:,i])**2
+        
+    ed_orig = np.sqrt(ed_orig_square)
+    ed = (ed_orig-ed_min)/(ed_max-ed_min)
+    
+    t_mean = np.mean(t,axis=2)  
+    p_mean = np.mean(p,axis=2)
+    
+    t_std = np.std(t,axis=2)
+    p_std = np.std(p,axis=2)
+    
+    tp_MinusMean_sum = t[:,:,0]*0
+    for i in range(ts_len):
+        tp_MinusMean_sum = tp_MinusMean_sum  + (t[:,:,i]-t_mean)*(p[:,:,i]-p_mean)
+        
+    tp_corr = tp_MinusMean_sum/(t_std * p_std * (ts_len-1))
+    
+    ssv = np.sqrt(ed**2 + (1-tp_corr)**2)
+    return ssv
+################################################################################################################
+def Get_datass_rasters(Sinpth,pn,split_file,poltype):
+    ##### to get 'nddss' 
+    
+    spth =  os.path.join(Sinpth,pn)
+    S1_files = os.listdir(spth)
+    days=[]
+#    print(S1_files)
+    for fs in S1_files:
+
+        if fs[-4:] != 'data':
+            continue
+#        print('fs[:-5]',fs[:-5])
+        dayss = dateConvertTodays(fs[:-5])
+        days.append(dayss)
+    
+  
+    print('days_all',days)
+    nddss = int((days[-1]-days[0])/12)+1
+    
+    ##### to get 'datas' 
+    days_above = days[0]  
+    data_lack_id = 0
+    days=[]
+    nfs = -1   
+         
+    for fs in S1_files:
+            
+        if fs[-4:] != 'data':
+            continue
+        print(fs[:-5])
+        
+        dayss = dateConvertTodays(fs[:-5])
+
+        if  nfs>-1 and dayss- days_above != 12:
+            nfs = nfs + 2
+            data_lack_id = 1
+            days.append(dayss-12)
+            days.append(dayss)
+            days_above  = dayss 
+            print('lack days',dayss-12)
+            
+        else:
+            nfs = nfs + 1
+            data_lack_id = 0
+            days.append(dayss)
+            days_above  = dayss
+            
+        print('image',os.path.join(spth,fs,poltype+str(split_file)+'.tif'))
+        data,proj,geoTransform,row,col,lat = read_tif_info(os.path.join(spth,fs,poltype+str(split_file)+'.tif'))
+        
+        if nfs == 0:
+            datas = (np.zeros((col,row,nddss))).astype('int64')
+
+        print('row_f,col_f',row,col)
+           
+
+        datas[:,:,nfs] = (100*10*np.log10(data)).astype('int64')
+        
+        if data_lack_id == 1:
+            datas[:,:,nfs-1] = (datas[:,:,nfs] + datas[:,:,nfs-2])/2
+      
+    return datas,proj,geoTransform,row,col,lat,nddss,days    
+################################################################################################################
+def findThredforClass(result_raster):
+    class_num = 200
+    result_raster_oneArray = result_raster.reshape(-1,1)
+    result_raster_oneArray = result_raster_oneArray[result_raster_oneArray>0]
+    ssv_max = max(result_raster_oneArray)
+    ssv_min = min(result_raster_oneArray)
+    interval_ssv = (ssv_max-ssv_min)/class_num
+    class_value = [ssv_min + interval_ssv * i for i in range(1,class_num+1)]
+    result_raster_pd = pd.DataFrame(result_raster_oneArray,sort=False)    ###将矩阵转化为paradas的格式
+    result_raster_pd.value_counts(bins=class_num)
+
+    maxtab,mintab = peakdet(class_value,result_raster,0.1)
+################################################################################################################
+def read_excel(excelfile,shname):
+    
+
+
+    ExcelFile=xlrd.open_workbook(excelfile)
+
+
+    print('EXCELname')
+    print(ExcelFile.sheet_names())
+
+    sheet=ExcelFile.sheet_by_name(shname)
+   
+
+    print('sheet row,col')
+    print(sheet.name,sheet.nrows,sheet.ncols)
+
+    arrs=np.zeros((sheet.nrows,sheet.ncols))
+    for i in range(sheet.nrows):
+        rows=sheet.row_values(i)
+        for j in range(sheet.ncols):
+            
+            if j>1 and rows[j]: 
+                arrs[i,j] = np.array(float(rows[j]))
+            elif rows[j] == '':
+                continue
+                
+    return arrs  
+################################################################################################################ 
+###
+###主程序开始
+###    
+################################################################################################################
+
+poltype='Sigma0_VH'
+
+#proNM=['helongjiang','jiangsu','gangdong','liaoning','poyanghu',''guangdong2019'']
+proNM=['helongjiang']
+Sinpth = r'E:\data\ChinaRice\SentinelPreprocessing\provinceSplit'    ##guangdong2019
+# Sinpth = r'E:\data\ChinaRice\SentinelPreprocessing\minSplit'
+excelpth = r'E:\data\ChinaRice\result\veritys'
+#Sinpth = r'F:\data\test'
+outpthPostTransplat=r'E:\data\ChinaRice\result\china\post_transplateAccure3'
+outpth=r"E:\data\ChinaRice\result\china\transplate_date_accurate_ssv3"
+#outpth=r'F:\data\ChinaRice\result\china\scaleResult'
+posttransplant_name = 'transplant_Early_Date'
+################################################################################################################  
+arrs = read_excel(os.path.join(excelpth,'veritySSVautocount_thred02.xlsx'),'allManual')
+x_manual = arrs[0,4:]
+
+################################################################################################################
+#######输入参数设置
+dmean_thrd = -20            ###在估算精确rice步骤中，获取rice的后向散射系数的阈值
+count_thrd = 0.2            ###在估算精确rice步骤中，获取个数峰值时的阈值
+
+ed_max=400*100                ###假设ed_max=400
+ed_min=0*100
+
+col_f = 0
+row_f = 1000
+
+slidWin=4
+num_bins = 200
+#pn=proNM[4]
+################################################################################################################
+for pn in proNM:
+    print(pn)
+    if pn =='poyanghu':
+        split_files = ['57']
+        y_manual = arrs[1,4:]
+    elif pn =='gangdong':
+        split_files = ['16']
+        y_manual = arrs[5,4:]
+    elif pn =='guangdong2019':
+        split_files = ['0mask']
+        y_manual = arrs[6,4:]
+        
+    elif pn =='helongjiang':
+        # split_files = ['44']
+        split_files = [str(spid) for spid in range(20)]
+        # split_files = ['4']
+        y_manual = arrs[4,4:]
+        
+    elif pn =='liaoning':
+        
+        split_files = ['8']
+        y_manual = arrs[2,4:]
+    elif pn =='jiangsu':
+
+        split_files = ['17']
+        y_manual = arrs[3,4:]
+    for split_file in split_files:
+################################################################################## 
+        if int(split_file)<19:
+            continue
+        # if int(split_file)>17:
+        #     continue
+        datas,proj,geoTransform,row,col,lat,nddss,days = Get_datass_rasters(Sinpth,pn,split_file,poltype)
+        datas_mean = datas*0
+
+
+        print('nddss',nddss)
+        print('days',days)
+        print('row,col',row,col)
+#############################################################################################################
+        if np.mean(lat) > 32:
+            earlyestdate = 100        ####post_transplate的阈值
+            latestdate = 243
+        else:
+            earlyestdate = 60
+            latestdate = 275
+ ################################################################################################################       
+        days=np.array(days)
+        earlyestdate_index = (np.where(((days-earlyestdate)[:-1] * (days-earlyestdate)[1:])<=0))[0][0]
+        latestdate_index = (np.where(((days-latestdate)[:-1] * (days-latestdate)[1:])<=0))[0][0]  
+        print('earlyestdate_index',earlyestdate_index)
+        print('latestdate_index',latestdate_index)
+################################################################################################################
+###插秧期估计
+
+        transplate_post_raster= np.zeros((col,row))-2
+
+        for i in range(slidWin,col-slidWin):
+        # for i in range(4718,4852):
+            
+            if i%500 == 0:
+                print('i',i)
+            # if i>4000:
+            #     continue
+            for j in range(slidWin,row-slidWin):
+            # for j in range(5466,5600):
+                # if j>4000:
+                #     continue
+                if datas[i,j,0] < -9999:
+                    continue
+                if datas[i,j,0] == 0:
+                    continue
+                # if i%50 == 0 and j%10 == 0:
+                # print('i,j',i,j)
+                
+                test_dist = datas[i-slidWin:i+slidWin-1,j-slidWin:j+slidWin-1,:]  
+                dmean = np.mean(test_dist,axis=0)[0]
+                if np.any(dmean<-10000):
+                    continue
+                
+                datas_mean[i,j,:]=dmean
+                    
+                # print('dmean',dmean)
+                
+                dindex = findMaxInterval(dmean,dmean_thrd)             ### dindex = (np.where(dmean<=dmean_thrd))[0]，也可以
+                # print('1 dindex',dindex)
+             
+                
+                ddifs = np.diff(dmean)
+                transplate_post= riceCondition(dmean.tolist(),ddifs.tolist(),dindex,earlyestdate_index,latestdate_index,lat)
+                if transplate_post <= 0:
+                    pass
+                else:
+                    transplate_post_raster[i,j] = int(days[transplate_post])
+                    # print('transplate_post_raster',transplate_post_raster[i,j])
+
+            
+        if os.path.exists(outpthPostTransplat):
+            pass
+        else:
+            os.mkdir(outpthPostTransplat)
+
+        outpathfile = os.path.join(outpthPostTransplat,posttransplant_name+pn+poltype+str(split_file)+'slid.tif')
+        write_raster(outpathfile,transplate_post_raster,geoTransform,proj)
+        
+    
+        # outpathfile = os.path.join(outpthPostTransplat,posttransplant_name+pn+poltype+str(split_file)+'slid.tif')
+        # transplate_post_raster,proj,geoTransform,row,col,lat = read_tif_info(outpathfile)
+        
+################################################################################################################ 
+#transplate_post_raster = np.zeros((col,row)) + 14
+   ##通过提取极大值获取水稻样本 
+        fig = plt.figure(figsize=(12,4))
+        riceAccurateType = findMaxCountRice(transplate_post_raster,days[earlyestdate_index],days[latestdate_index],count_thrd,fig)
+        print('riceAccurateType',riceAccurateType)
+
+        ricetype_len = len(riceAccurateType)
+        ssvs = np.zeros((col,row,ricetype_len))+10
+        for i in range(ricetype_len):
+            print('riceAccurateType',riceAccurateType[i])
+    ####通过精确获取的rice，进而得到训练样本的时间序列的后向散射系数traning_backs_curve
+            traning_backs_raster = datas_mean[transplate_post_raster == riceAccurateType[i]]   ####traning_backs_raster的第一列为datas[:,:,1]的所有的等于riceAccurateType[i]的值
+            
+            traning_backs_curve =  np.mean(traning_backs_raster,axis=0)
+            ts_len = nddss
+            traning_backs_curve_raster = np.zeros((col,row,ts_len))
+            for j in range(ts_len):
+                traning_backs_curve_raster[:,:,j] = traning_backs_curve_raster[:,:,j] + traning_backs_curve[j]
+ ##ssm算法                   
+            # print('j,traning_backs_curve_raster',j,traning_backs_curve_raster)
+            ssvs[:,:,i] = ssvAlgor(traning_backs_curve_raster,datas_mean,ts_len,ed_max,ed_min)
+    
+
+        ssv_last = np.min(ssvs,axis=2)
+        ssv_last[ssv_last>10]=-1
+        # ssv_last=10*np.log10(ssv_last)
+    
+################################################################################################################  
+        if os.path.exists(outpth):
+            pass
+        else:
+  
+            os.mkdir(outpth)
+            
+        outpathfile = os.path.join(outpth,'ssv'+pn+poltype+str(split_file)+'slidmean.tif')
+        if os.path.exists(outpathfile):
+            os.remove(outpathfile)
+        else:
+            pass
+        write_raster(outpathfile,ssv_last,geoTransform,proj)
+        
+        #
+        # plotthred(x_manual,y_manual,ssv_last,num_bins,fig)
+        
+        #
+        
+end = time.clock()            
+print('run time',(end-start)/60)  
+
+
